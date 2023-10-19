@@ -1,0 +1,171 @@
+---
+title: "Modeling Competition V1"
+format:
+  html:
+    toc: true
+    toc-location: left
+    df-print: kable
+execute: 
+  warning: false
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| 
+
+# load packages
+library(magrittr)
+library(tidyverse)
+library(tidymodels)
+library(modeldata)
+library(glmnet)
+
+```
+
+## View dataset
+
+```{r}
+#| label: data
+
+# set seed with Mark
+set.seed(1)
+
+# make test / train split
+ames_split <- initial_split(data = ames %>% mutate(row_number = row_number()),
+                            prop = .8)
+nrow(ames_split %>% testing())
+
+# save train data
+ames_train <- ames_split %>% training() %>% janitor::clean_names()
+glimpse(ames_train)
+
+# check to make sure test matches marks
+ames_train %>% pull(row_number) %>% head()
+
+# remove row number
+ames_train %<>% select(-row_number)
+
+```
+
+## Bootstrap models
+
+Steps
+
+- Loop $b$ times:
+
+    1. Create bootstrap sample of train data
+
+    2. Fit 10 fold CV to find optimal $\lambda$ for `sales_price ~ only numeric predictors` (think `cv.glmnet()` only works with numeric predictors or there was too many levels of the other??).
+
+    3. Fit lasso regression using optimal $\lambda$.
+
+    4. Keep track of variables not shrunk to zero.
+
+```{r}
+#| label: bootstrap models
+#| cache: true
+
+# loop to do variable selection from b bootstrap samples
+# -> combine results from all samples
+b <- 10000
+results <- lapply(X = 1:b, FUN = function(X) {
+  
+  # create bootstrap sample
+  ames_boot = ames_train[sample(x = 1:nrow(ames_train), size = nrow(ames_train), replace = TRUE), ]
+  
+  # find optimal lambda from 10-fold cross validation
+  x = ames_boot %>% select(where(is.numeric), -sale_price) %>% as.matrix
+  y = ames_boot %>% select(sale_price) %>% as.matrix
+  lambda = cv.glmnet(x =  x, y = y)$lambda.min
+  
+  # fit lasso model based on optimal lambda
+  mod_boot = glmnet(x = x, y = y, lambda = lambda)
+  
+  # get variable names
+  betas = mod_boot$beta
+  
+  # get nonzero beta coefficients
+  # -> convert to dataframe in order determine if variable should be kept (have to convert to matrix first)
+  # -> transpose so can row bind final results and summarize with column sums for frequency kept
+  vars = betas %>% 
+    as.matrix %>% 
+    data.frame %>% 
+    mutate(kept = if_else(s0 != 0, 1, 0)) %>% 
+    select(-s0) %>% 
+    t
+  
+  # status counter
+  #if (X %% 10 == 0) print(X)
+  
+  return(vars)
+  
+}) %>% 
+  Reduce(x = ., f = rbind)
+rownames(results) <- NULL
+
+dim(results)
+head(results) %>% data.frame
+
+```
+
+## Variable selection
+
+Steps
+
+1. Calculate the total number of samples (out of $b$) that each variable was kept.
+
+2. Create variable selection plot, ordered from least to most (in terms of proportion of samples kept) with a threshold plotted.
+
+3. Only keep variables that we kept above the threshold.
+
+4. Convert final model variables into to formula
+
+```{r}
+#| label: variable selection
+
+# summarize results for number of times variable was kept in model
+results_summ <- results %>% 
+  as.data.frame() %>% 
+  summarize(across(everything(), sum))
+results_summ
+
+# create variable selection plot
+# set threshold
+th <- 0.8
+results_summ %>% 
+  t %>% 
+  as.data.frame %>% 
+  rownames_to_column(var = "var") %>% 
+  rename(kept = V1) %>% 
+  arrange(kept) %>% 
+  mutate(var = fct_inorder(f = var)) %>% 
+  ggplot(aes(x = kept / b,
+             y = var)) + 
+  geom_point() + 
+  geom_vline(aes(xintercept = th),
+             color = "blue") + 
+  labs(title = "Variable selection plot",
+       x = "Proportion of bootstrap samples coefficient not shrunk to 0",
+       y = "Variable") + 
+  theme_bw()
+
+# select final variables
+final_vars <- results_summ %>% 
+  pivot_longer(cols = everything(),
+               names_to = "var",
+               values_to = "kept_n") %>% 
+  mutate(kept_prop = kept_n / b) %>% 
+  filter(kept_prop > th)
+nrow(final_vars)
+
+# create formula
+mod_final <- paste("sale_price",
+                   paste(final_vars$var, collapse = " + "),
+                   sep = " ~ ") %>% as.formula
+mod_final
+
+```
+
+
