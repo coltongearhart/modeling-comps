@@ -16,7 +16,6 @@ execute:
 #| label: setup
 
 # load packages
-library(magrittr)
 library(tidyverse)
 library(tidymodels)
 library(modeldata)
@@ -166,11 +165,11 @@ formula_final <- paste("sale_price",
 formula_final
 
 # hard coded formula
-"sale_price ~ lot_frontage + lot_area + year_built + year_remod_add + 
+formula_final <- c("sale_price ~ lot_frontage + lot_area + year_built + year_remod_add + 
     mas_vnr_area + bsmt_unf_sf + total_bsmt_sf + first_flr_sf + 
     gr_liv_area + bsmt_full_bath + bedroom_abv_gr + kitchen_abv_gr + 
     tot_rms_abv_grd + fireplaces + garage_cars + garage_area + 
-    wood_deck_sf + screen_porch + pool_area + misc_val + latitude"
+    wood_deck_sf + screen_porch + pool_area + misc_val + latitude") %>% as.formula
 
 # fit final model
 mod_final <- lm(formula_final, data = ames_train)
@@ -233,7 +232,7 @@ formula_final_prime <- c("log(sale_price) ~ lot_frontage + lot_area + year_built
     wood_deck_sf + screen_porch + pool_area + misc_val + latitude") %>% as.formula
 
 # fit transformed model
-mod_final_prime <- lm(formula_final_prime, data = ames_train)
+mod_final_prime <- lm(formula_final_prime, data = ames_train, x = TRUE)
 
 ```
 
@@ -269,5 +268,27 @@ preds_prime <- predict(mod_final_prime, newdata = ames_test)
 
 # back transform predictions and calculate rmse
 bind_cols(ames_test, preds = exp(preds_prime)) %>% yardstick::rmse(sale_price, preds)
+
+```
+
+## Check for higher order terms
+
+```{r}
+#| label: residual-plots-x
+#| eval: false
+
+# get residuals
+e <- residuals(mod_final_prime)
+
+# plot against each X
+mod_final_prime$x %>% 
+  data.frame %>% 
+  select(-1) %>% 
+  lapply(function(x) {
+    plot(x = x, y = e)
+    lines(lowess(x = x, y = e), col = "red") %>% return
+ })
+
+# no signs of curvature
 
 ```
