@@ -16,6 +16,7 @@ execute:
 #| label: setup
 
 # load packages
+library(magrittr)
 library(tidyverse)
 library(tidymodels)
 library(modeldata)
@@ -278,16 +279,15 @@ bind_cols(ames_test, preds = exp(preds_prime)) %>% yardstick::rmse(sale_price, p
 #| eval: false
 
 # get residuals
-e <- residuals(mod_final_prime)
+e <- residuals(mod_final_prime) 
 
 # plot against each X
-mod_final_prime$x %>% 
-  data.frame %>% 
-  select(-1) %>% 
-  lapply(function(x) {
-    plot(x = x, y = e)
-    lines(lowess(x = x, y = e), col = "red") %>% return
- })
+nms_x <- colnames(mod_final_prime$x[, -1])
+map2(data.frame(mod_final_prime$x)[, -1], nms_x, function(x, nm) {
+  plot(x = x, y = e, main = nm)
+  lines(lowess(x = x, y = e), col = "red")
+  abline(h = 0, col = "grey")
+})
 
 # no signs of curvature
 
