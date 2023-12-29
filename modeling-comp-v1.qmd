@@ -13,12 +13,12 @@ execute:
 ## Setup
 
 ```{r}
-#| label: setup
 
 # load packages
 library(magrittr)
 library(tidyverse)
 library(tidymodels)
+library(furrr)
 library(modeldata)
 library(glmnet)
 
@@ -27,32 +27,33 @@ library(glmnet)
 ### View dataset
 
 ```{r}
-#| label: data
 
 # set seed with Mark
 set.seed(1)
 
 # make test / train split
-ames_split <- initial_split(data = ames %>% mutate(row_number = row_number()),
+split_ames <- initial_split(data = ames %>% mutate(row_number = row_number()),
                             prop = .8)
-nrow(ames_split %>% testing())
+nrow(split_ames %>% testing())
 
 # save train data
-ames_train <- ames_split %>% training() %>% janitor::clean_names()
-glimpse(ames_train)
+data_train <- split_ames %>% training() %>% janitor::clean_names()
+glimpse(data_train)
 
 # check to make sure test matches marks
-ames_train %>% pull(row_number) %>% head()
+data_train %>% pull(row_number) %>% head()
 
 # remove row number
-ames_train %<>% select(-row_number)
+data_train %<>% select(-row_number)
 
 # save test data
-ames_test <- ames_split %>% testing() %>% janitor::clean_names()
+data_test <- split_ames %>% testing() %>% janitor::clean_names()
 
 ```
 
 ## Bootstrap models
+
+### Fit models and do variable selection
 
 Steps
 
@@ -66,27 +67,56 @@ Steps
 
     4. Keep track of variables not shrunk to zero.
 
-```{r}
-#| label: bootstrap-models
+Create bootstrap samples.
 
-# loop to do variable selection from b bootstrap samples
-# -> combine results from all samples
-b <- 10000
-results <- parallel::mclapply(X = 1:b, FUN = function(X) {
+```{r}
+
+# create bootstrap samples
+b <- 1000
+data_boot <- rsample::bootstraps(data_train, times = b)
+tmp_boot <- data_boot$splits[[1]] %>% analysis
+head(tmp_boot)
+
+```
+
+Define helper functions for fitting models.
+
+```{r}
+
+# define function to fit lasso based on optimal lambda
+# -> 1) setup modeling frame
+# --> creates design matrix of only numeric predictors and creates response vector
+# -> 2) find optimal lambda
+# --> run 10-fold cross validation and extract best lambda
+# -> 3) fit lasso model
+fit_lasso <- function(df, y) {
   
-  # create bootstrap sample
-  ames_boot = ames_train[sample(x = 1:nrow(ames_train), size = nrow(ames_train), replace = TRUE), ]
+  # create design matrix
+  X = df %>% 
+    select(where(is.numeric), -any_of(y)) %>% 
+    as.matrix
   
-  # find optimal lambda from 10-fold cross validation
-  x = ames_boot %>% select(where(is.numeric), -sale_price) %>% as.matrix
-  y = ames_boot %>% select(sale_price) %>% as.matrix
-  lambda = cv.glmnet(x =  x, y = y)$lambda.min
+  # create response vector
+  y = df %>% select(any_of(y)) %>% as.matrix
+  
+  # find lambda
+  lambda = cv.glmnet(x = X, y = y)$lambda.min
   
   # fit lasso model based on optimal lambda
-  mod_boot = glmnet(x = x, y = y, lambda = lambda)
+  mod_boot = glmnet(x = X, y = y, lambda = lambda)
   
-  # get variable names
-  betas = mod_boot$beta
+  return(mod_boot)
+}
+
+# test function
+tmp_mod <- tmp_boot %>% fit_lasso(y = "sale_price")
+tmp_mod
+
+# define function to report kept variables in the model
+report_vars <- function(mod) {
+  
+   # get variable names
+  betas = mod$beta
   
   # get nonzero beta coefficients
   # -> convert to dataframe in order determine if variable should be kept (have to convert to matrix first)
@@ -96,23 +126,21 @@ results <- parallel::mclapply(X = 1:b, FUN = function(X) {
     data.frame %>% 
     mutate(kept = if_else(s0 != 0, 1, 0)) %>% 
     select(-s0) %>% 
-    t
+    t %>% 
+    data.frame
   
-  # status counter
-  #if (X %% 10 == 0) print(X)
+  rownames(vars) = NULL
   
   return(vars)
-  
-}, mc.cores = 6) %>% 
-  Reduce(x = ., f = rbind)
-rownames(results) <- NULL
+}
 
-dim(results)
-head(results) %>% data.frame
+# test function
+tmp_vars <- tmp_mod %>% report_vars
+glimpse(tmp_vars)
 
 ```
 
-### Variable selection
+Fit all bootstrap models and get results.
 
 Steps
 
@@ -125,26 +153,35 @@ Steps
 4. Convert final model variables into to formula
 
 ```{r}
-#| label: variable-selection
+
+# setup plan
+plan(multisession, workers = availableCores()-4)
+
+# fit all bootstrap models
+data_boot$models <- data_boot$splits %>% future_map(function(split) {
+  analysis(split) %>% fit_lasso(y = "sale_price")
+}, .progress = TRUE)
+
+# get kept variables
+data_boot$variables <- data_boot$models %>% map(\(mod) report_vars(mod))
 
 # summarize results for number of times variable was kept in model
-results_summ <- results %>% 
-  as.data.frame() %>% 
-  summarize(across(everything(), sum))
-results_summ
+results_boot <- data_boot$variables %>% 
+  reduce(bind_rows) %>% 
+  summarize(across(everything(), sum)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "kept_n") %>% 
+  mutate(kept_prop = kept_n / b) %>% 
+  arrange(desc(kept_n))
 
 # create variable selection plot
 # set threshold
 th <- 0.8
-results_summ %>% 
-  t %>% 
-  as.data.frame %>% 
-  rownames_to_column(var = "var") %>% 
-  rename(kept = V1) %>% 
-  arrange(kept) %>% 
-  mutate(var = fct_inorder(f = var)) %>% 
-  ggplot(aes(x = kept / b,
-             y = var)) + 
+results_boot %>% 
+  mutate(variable = fct_rev(fct_inorder(f = variable))) %>% 
+  ggplot(aes(x = kept_prop,
+             y = variable)) + 
   geom_point() + 
   geom_vline(aes(xintercept = th),
              color = "blue") + 
@@ -154,66 +191,63 @@ results_summ %>%
   theme_bw()
 
 # select final variables
-final_vars <- results_summ %>% 
-  pivot_longer(cols = everything(),
-               names_to = "var",
-               values_to = "kept_n") %>% 
-  mutate(kept_prop = kept_n / b) %>% 
+vars_boot <- results_boot %>% 
   filter(kept_prop > th)
-nrow(final_vars)
+nrow(vars_boot)
+
+```
+
+```{r}
 
 # create formula
-formula_final <- paste("sale_price",
-                   paste(final_vars$var, collapse = " + "),
+formula_boot <- paste("sale_price",
+                   paste(vars_boot$variable, collapse = " + "),
                    sep = " ~ ") %>% as.formula
-formula_final
+formula_boot
 
 # hard coded formula
-formula_final <- c("sale_price ~ lot_frontage + lot_area + year_built + year_remod_add + 
-    mas_vnr_area + bsmt_unf_sf + total_bsmt_sf + first_flr_sf + 
-    gr_liv_area + bsmt_full_bath + bedroom_abv_gr + kitchen_abv_gr + 
-    tot_rms_abv_grd + fireplaces + garage_cars + garage_area + 
-    wood_deck_sf + screen_porch + pool_area + misc_val + latitude") %>% as.formula
+# -> note this formula is from when run on b = 10000
+formula_boot <- "sale_price ~ year_built + year_remod_add + mas_vnr_area + kitchen_abv_gr + latitude + total_bsmt_sf + fireplaces + garage_cars + screen_porch + wood_deck_sf + bsmt_full_bath + bedroom_abv_gr + gr_liv_area + lot_frontage + tot_rms_abv_grd + garage_area + lot_area + misc_val + pool_area + bsmt_unf_sf + first_flr_sf" %>% as.formula
 
-# fit final model
-mod_final <- lm(formula_final, data = ames_train)
+# specify model
+spec_boot <- linear_reg()
+
+# fit the model based on bootstrap variable selection
+fit_boot <- spec_boot %>% 
+  fit(formula_boot, data = data_train)
 
 ```
 
 ### Test
 
 ```{r}
-#| label: testing
-
-# calculate predictions for test set
-preds <- predict(mod_final, newdata = ames_test)
 
 # calculate rmse
-bind_cols(ames_test, preds = preds) %>% yardstick::rmse(sale_price, preds)
+augment(fit_boot, new_data = data_test) %>% 
+  rmse(truth = sale_price, estimate = .pred)
 
 ```
 
 ## Incorporate model diagnostics
 
 ```{r}
-#| label: diagnostics
 
 # check final model diagnostics
-plot(mod_final, which = 1:2)
+plot(fit_boot$fit, which = 1:2)
 
 ```
 
 Seems like increasing variance and non-normal (heavy-tailed) errors. So try to remedy.
 
 ```{r}
-#| label: boxcox
 
 # run boxcox procedure
 # -> plot MLE of lambda
-MASS::boxcox(mod_final)
+tmp_mod <- lm(formula(fit_boot$fit), data_train)
+MASS::boxcox(tmp_mod)
 
 # extract lambda
-bc <- MASS::boxcox(mod_final)
+bc <- MASS::boxcox(tmp_mod)
 bc$x[which.max(bc$y)]
 
 ```
@@ -223,37 +257,31 @@ bc$x[which.max(bc$y)]
 Use $Y' = \ln(Y)$. Now fit transformed model.
 
 ```{r}
-#| label: transformed-model
 
 # hard coded formula
-formula_final_prime <- c("log(sale_price) ~ lot_frontage + lot_area + year_built + year_remod_add + 
-    mas_vnr_area + bsmt_unf_sf + total_bsmt_sf + first_flr_sf + 
-    gr_liv_area + bsmt_full_bath + bedroom_abv_gr + kitchen_abv_gr + 
-    tot_rms_abv_grd + fireplaces + garage_cars + garage_area + 
-    wood_deck_sf + screen_porch + pool_area + misc_val + latitude") %>% as.formula
+formula_boot_prime <- c("log(sale_price) ~ year_built + year_remod_add + mas_vnr_area + kitchen_abv_gr + latitude + total_bsmt_sf + fireplaces + garage_cars + screen_porch + wood_deck_sf + bsmt_full_bath + bedroom_abv_gr + gr_liv_area + lot_frontage + tot_rms_abv_grd + garage_area + lot_area + misc_val + pool_area + bsmt_unf_sf + first_flr_sf") %>% as.formula
 
-# fit transformed model
-mod_final_prime <- lm(formula_final_prime, data = ames_train, x = TRUE)
+# fit transformed model model based on bootstrap variable selection
+fit_boot_prime <- spec_boot %>% 
+  fit(formula_boot_prime, data = data_train)
 
 ```
 
 Now inspect transformed model diagnostics.
 
 ```{r}
-#| label: diagnostics-transformed
 
 # check final model diagnostics
-plot(mod_final_prime, which = 1:2)
+plot(fit_boot_prime$fit, which = 1:2)
 
 ```
 
 See improvement in non-constant variance and slightly so in the normality of the errors. Also see increase in $R^2_{adj}$.
 
 ```{r}
-#| label: summaries
 
 # compare model summaries
-map(list(mod_final, mod_final_prime), summary)
+map(list(fit_boot, fit_boot_prime), glance)
 
 ```
 
@@ -262,13 +290,13 @@ map(list(mod_final, mod_final_prime), summary)
 With $Y' = \ln(Y)$ $\Longrightarrow$ $Y = f'(Y') = e^{ln(Y)} = e^{Y'}$. Now back transform predictions and test.
 
 ```{r}
-#| label: testing-transformed
 
 # calculate predictions for test set
-preds_prime <- predict(mod_final_prime, newdata = ames_test)
+preds_prime <- predict(fit_boot_prime, new_data = data_test)
 
 # back transform predictions and calculate rmse
-bind_cols(ames_test, preds = exp(preds_prime)) %>% yardstick::rmse(sale_price, preds)
+rmse_vec(truth = data_test$sale_price %>% as.numeric,
+         estimate = exp(preds_prime)$.pred)
 
 ```
 
@@ -277,15 +305,14 @@ bind_cols(ames_test, preds = exp(preds_prime)) %>% yardstick::rmse(sale_price, p
 Plotting residuals against each $X$ to check for signs of curvature.
 
 ```{r}
-#| label: residual-plots-x
 #| eval: false
 
 # get residuals
-e <- residuals(mod_final_prime) 
+e <- residuals(fit_boot_prime$fit) 
 
 # plot against each X
-nms_x <- colnames(mod_final_prime$x[, -1])
-map2(data.frame(mod_final_prime$x)[, -1], nms_x, function(x, nm) {
+nms_x <- colnames(fit_boot_prime$fit$model[, -1])
+map2(data.frame(fit_boot_prime$fit$model)[, -1], nms_x, function(x, nm) {
   plot(x = x, y = e, main = nm)
   lines(lowess(x = x, y = e), col = "red")
   abline(h = 0, col = "grey")
@@ -300,32 +327,27 @@ map2(data.frame(mod_final_prime$x)[, -1], nms_x, function(x, nm) {
 Plotting residuals against each $X_i X_j$ to check for signs of interaction.
 
 ```{r}
-#| label: full-interaction-model
 
 # hard coded formula with all terms crossed
-formula_final_prime_all_crossed <- c("log(sale_price) ~ (lot_frontage + lot_area + year_built + year_remod_add + 
-    mas_vnr_area + bsmt_unf_sf + total_bsmt_sf + first_flr_sf + 
-    gr_liv_area + bsmt_full_bath + bedroom_abv_gr + kitchen_abv_gr + 
-    tot_rms_abv_grd + fireplaces + garage_cars + garage_area + 
-    wood_deck_sf + screen_porch + pool_area + misc_val + latitude)^2") %>% as.formula
+formula_boot_prime_crossed <- c("log(sale_price) ~ (year_built + year_remod_add + mas_vnr_area + kitchen_abv_gr + latitude + total_bsmt_sf + fireplaces + garage_cars + screen_porch + wood_deck_sf + bsmt_full_bath + bedroom_abv_gr + gr_liv_area + lot_frontage + tot_rms_abv_grd + garage_area + lot_area + misc_val + pool_area + bsmt_unf_sf + first_flr_sf)^2") %>% as.formula
 
 # get residuals of original model
-e <- residuals(mod_final_prime)
+e <- residuals(fit_boot_prime$fit)
 
 # fit model with all possible interaction terms
 # -> using to extract design matrix of interaction terms
-mod_final_prime_int <- lm(formula_final_prime_all_crossed, data = ames_train, x = TRUE)
-terms <- tidy(mod_final_prime_int)
+# -> NOTE: using lm() cause need design matrix
+mod_boot_prime_crossed <- lm(formula_boot_prime_crossed,data = data_train, x = TRUE)
+terms <- tidy(mod_boot_prime_crossed)
 
 ```
 
 ```{r}
-#| label: residual-plots-x1x2
 #| eval: false
 
 # extract interaction terms
 # -> interaction symbol : gets recoded as .
-X_int <- mod_final_prime_int$x %>% 
+X_int <- mod_boot_prime_crossed$x %>% 
   data.frame %>% 
   select(contains("."), -contains("Intercept"))
 
@@ -340,41 +362,41 @@ map2(X_int, nms_x_int, function(x, nm) {
 # no obvious visual signs of significant interactions
 
 # partial F test on ALL interaction terms
-anova(mod_final_prime_int, mod_final_prime)
+anova(mod_boot_prime_crossed, fit_boot_prime$fit)
 
 ```
 
 This shows at least one interaction term is significant. So lets find out which ones.
 
 ```{r}
-#| label: testing-interaction
 
 # get only "significant" interaction terms
 # -> essentially a z value
-t_crit <- qt(p = 0.975, df = nrow(ames_train) - 1)
+t_crit <- qt(p = 0.975, df = nrow(data_train) - 1)
 terms %>% filter(abs(statistic) > t_crit) %>% 
   filter(str_detect(term, ":")) %>% 
   pull(term) %>% 
   reduce(paste0, " + ")
 
-# copy and paste to hardcode formula from results above
-formula_final_prime_int2 <- "log(sale_price) ~ lot_area + year_built + year_remod_add + mas_vnr_area + bsmt_unf_sf + total_bsmt_sf + first_flr_sf + gr_liv_area + bsmt_full_bath + bedroom_abv_gr + kitchen_abv_gr +  tot_rms_abv_grd + fireplaces + garage_cars + garage_area + wood_deck_sf + screen_porch + pool_area + misc_val + latitude + lot_frontage:misc_val + lot_area:mas_vnr_area + lot_area:gr_liv_area + lot_area:garage_area + lot_area:misc_val + year_built:first_flr_sf + year_built:gr_liv_area + year_built:fireplaces + year_built:garage_cars + year_built:garage_area + year_built:latitude + year_remod_add:first_flr_sf + year_remod_add:gr_liv_area + year_remod_add:bedroom_abv_gr + year_remod_add:latitude + mas_vnr_area:bedroom_abv_gr + mas_vnr_area:tot_rms_abv_grd + mas_vnr_area:garage_area + mas_vnr_area:pool_area + bsmt_unf_sf:bedroom_abv_gr + bsmt_unf_sf:garage_area + total_bsmt_sf:gr_liv_area + gr_liv_area:fireplaces + gr_liv_area:garage_cars + gr_liv_area:garage_area + bedroom_abv_gr:fireplaces + kitchen_abv_gr:tot_rms_abv_grd + kitchen_abv_gr:latitude + tot_rms_abv_grd:wood_deck_sf + fireplaces:garage_cars + fireplaces:garage_area + fireplaces:latitude" %>% as.formula
+# copy and paste to hardcoded formula from results above
+formula_boot_prime_int <- "log(sale_price) ~ year_built + year_remod_add + mas_vnr_area + kitchen_abv_gr + latitude + total_bsmt_sf + fireplaces + garage_cars + screen_porch + wood_deck_sf + bsmt_full_bath + bedroom_abv_gr + gr_liv_area + lot_frontage + tot_rms_abv_grd + garage_area + lot_area + misc_val + pool_area + bsmt_unf_sf + first_flr_sf + year_built:latitude + year_built:fireplaces + year_built:garage_cars + year_built:gr_liv_area + year_built:garage_area + year_built:first_flr_sf + year_remod_add:latitude + year_remod_add:bedroom_abv_gr + year_remod_add:gr_liv_area + year_remod_add:first_flr_sf + mas_vnr_area:bedroom_abv_gr + mas_vnr_area:tot_rms_abv_grd + mas_vnr_area:garage_area + mas_vnr_area:lot_area + kitchen_abv_gr:latitude + kitchen_abv_gr:tot_rms_abv_grd + latitude:fireplaces + total_bsmt_sf:gr_liv_area + fireplaces:garage_cars + fireplaces:bedroom_abv_gr + fireplaces:gr_liv_area + fireplaces:garage_area + garage_cars:gr_liv_area + wood_deck_sf:tot_rms_abv_grd + bedroom_abv_gr:bsmt_unf_sf + gr_liv_area:garage_area + gr_liv_area:lot_area + lot_frontage:misc_val + garage_area:lot_area + garage_area:bsmt_unf_sf + lot_area:misc_val" %>% as.formula
 
-# fit model with all potentially important interaction terms
-mod_final_prime_int2 <- lm(formula_final_prime_int2, data = ames_train)
+# fit transformed model model based on bootstrap variable selection
+fit_boot_prime_int <- spec_boot %>% 
+  fit(formula_boot_prime_int, data = data_train)
 
 # more partial F tests on interaction terms
 # -> first to see if selected interaction model is better than additive model
 # -> then to see if selected interaction model is better than all interaction model
-anova(mod_final_prime_int2, mod_final_prime)
-anova(mod_final_prime_int, mod_final_prime_int2)
+anova(fit_boot_prime_int$fit, fit_boot_prime$fit)
+anova(mod_boot_prime_crossed, fit_boot_prime_int$fit)
 
 # definite yes to first test
 # marginal yes to second test
 
 # check R2s for the two interaction models
-broom::glance(mod_final_prime_int2)
-broom::glance(mod_final_prime_int)
+# compare model summaries
+map(list(mod_boot_prime_crossed, fit_boot_prime_int$fit), glance)
 
 # not much increase in model fit, so going with the more parsimonious model
 
@@ -383,207 +405,14 @@ broom::glance(mod_final_prime_int)
 ### Test with backtransformed predictions
 
 ```{r}
-#| label: testing-transformed-interaction
 
 # calculate predictions for test set
-preds_prime_int2 <- predict(mod_final_prime_int2, newdata = ames_test)
+preds_prime_int <- predict(fit_boot_prime_int, new_data = data_test)
 
 # back transform predictions and calculate rmse
-bind_cols(ames_test, preds = exp(preds_prime_int2)) %>% yardstick::rmse(sale_price, preds)
+rmse_vec(truth = data_test$sale_price %>% as.numeric,
+         estimate = exp(preds_prime_int)$.pred)
 
 ```
 
 BEST MODEL!!!
-
-## Bootstrap with interaction models
-
-Repeating same process, except now starting with all potential two-way interaction terms, still only for numeric predictors.
-
-```{r}
-#| label: bootstrap-interaction-models
-
-# loop to do variable selection from b bootstrap samples
-# -> combine results from all samples
-b <- 1000
-results <- parallel::mclapply(X = 1:b, FUN = function(X) {
-  
-  # create bootstrap sample
-  ames_boot = ames_train[sample(x = 1:nrow(ames_train), size = nrow(ames_train), replace = TRUE), ]
-  
-  # find optimal lambda from 10-fold cross validation
-  # -> fit fully crossed interaction model to extract design matrix (expect the intercept)
-  x = lm(sale_price ~ .^2, data = ames_boot %>% select(where(is.numeric)), x = TRUE)$x[, -1] %>% as.matrix
-  y = ames_boot %>% select(sale_price) %>% as.matrix
-  lambda = cv.glmnet(x =  x, y = y)$lambda.min
-  
-  # fit lasso model based on optimal lambda
-  mod_boot = glmnet(x = x, y = y, lambda = lambda)
-  
-  # get variable names
-  betas = mod_boot$beta
-  
-  # get nonzero beta coefficients
-  # -> convert to dataframe in order determine if variable should be kept (have to convert to matrix first)
-  # -> transpose so can row bind final results and summarize with column sums for frequency kept
-  vars = betas %>% 
-    as.matrix %>% 
-    data.frame %>% 
-    mutate(kept = if_else(s0 != 0, 1, 0)) %>% 
-    select(-s0) %>% 
-    t
-  
-  # status counter
-  #if (X %% 10 == 0) print(X)
-  
-  return(vars)
-  
-}, mc.cores = 6) %>% 
-  Reduce(x = ., f = rbind)
-rownames(results) <- NULL
-
-dim(results)
-head(results) %>% data.frame
-
-```
-
-### Variable selection
-
-```{r}
-#| label: variable-selection2
-
-# summarize results for number of times variable was kept in model
-results_summ <- results %>% 
-  as.data.frame() %>% 
-  summarize(across(everything(), sum))
-results_summ
-
-# create variable selection plot
-# set threshold
-th <- 0.8
-results_summ %>% 
-  t %>% 
-  as.data.frame %>% 
-  rownames_to_column(var = "var") %>% 
-  rename(kept = V1) %>% 
-  arrange(kept) %>% 
-  mutate(var = fct_inorder(f = var)) %>% 
-  ggplot(aes(x = kept / b,
-             y = var)) + 
-  geom_point() + 
-  geom_vline(aes(xintercept = th),
-             color = "blue") + 
-  labs(title = "Variable selection plot",
-       x = "Proportion of bootstrap samples coefficient not shrunk to 0",
-       y = "Variable") + 
-  theme_bw()
-
-# select final variables
-final_vars <- results_summ %>% 
-  pivot_longer(cols = everything(),
-               names_to = "var",
-               values_to = "kept_n") %>% 
-  mutate(kept_prop = kept_n / b) %>% 
-  filter(kept_prop > th)
-nrow(final_vars)
-
-# create formula
-formula_final_int <- paste("sale_price",
-                   paste(final_vars$var, collapse = " + "),
-                   sep = " ~ ") %>% as.formula
-formula_final_int
-
-# hard coded formula
-formula_final_int <- c("sale_price ~ latitude + lot_area:year_built + year_built:year_remod_add + year_built:total_bsmt_sf + mas_vnr_area:bsmt_full_bath + mas_vnr_area:garage_cars + mas_vnr_area:wood_deck_sf + mas_vnr_area:open_porch_sf +  bsmt_fin_sf_2:bsmt_unf_sf + bsmt_unf_sf:bsmt_full_bath + total_bsmt_sf:fireplaces + first_flr_sf:garage_cars + second_flr_sf:fireplaces + bsmt_full_bath:full_bath + bsmt_full_bath:bedroom_abv_gr + bsmt_full_bath:enclosed_porch + bsmt_half_bath:misc_val + full_bath:garage_area + bedroom_abv_gr:fireplaces + kitchen_abv_gr:garage_cars +  garage_cars:open_porch_sf") %>% as.formula
-
-# fit final model
-mod_final_int <- lm(formula_final_int, data = ames_train)
-
-```
-
-### Test
-
-```{r}
-#| label: testing-2
-
-# calculate predictions for test set
-preds <- predict(mod_final, newdata = ames_test)
-
-# calculate rmse
-bind_cols(ames_test, preds = preds) %>% yardstick::rmse(sale_price, preds)
-
-```
-
-### Incorporate model diagnostics
-
-```{r}
-#| label: diagnostics-2
-
-# check final model diagnostics
-plot(mod_final_int, which = 1:2)
-
-```
-
-Variance seems good, non-normal (heavy-tailed) errors. So try to remedy.
-
-```{r}
-#| label: boxcox-2
-
-# run boxcox procedure
-# -> plot MLE of lambda
-MASS::boxcox(mod_final_int)
-
-# extract lambda
-bc <- MASS::boxcox(mod_final_int)
-bc$x[which.max(bc$y)]
-
-```
-
-### Transform model
-
-Use $Y' = \sqrt{Y}$. Now fit transformed model.
-
-```{r}
-#| label: transformed-model-2
-
-# hard coded formula
-formula_final_int_prime <- c("sqrt(sale_price) ~ latitude + lot_area:year_built + year_built:year_remod_add + year_built:total_bsmt_sf + mas_vnr_area:bsmt_full_bath + mas_vnr_area:garage_cars + mas_vnr_area:wood_deck_sf + mas_vnr_area:open_porch_sf +  bsmt_fin_sf_2:bsmt_unf_sf + bsmt_unf_sf:bsmt_full_bath + total_bsmt_sf:fireplaces + first_flr_sf:garage_cars + second_flr_sf:fireplaces + bsmt_full_bath:full_bath + bsmt_full_bath:bedroom_abv_gr + bsmt_full_bath:enclosed_porch + bsmt_half_bath:misc_val + full_bath:garage_area + bedroom_abv_gr:fireplaces + kitchen_abv_gr:garage_cars +  garage_cars:open_porch_sf") %>% as.formula
-
-# fit transformed model
-mod_final_int_prime <- lm(formula_final_int_prime, data = ames_train, x = TRUE)
-
-```
-
-Now inspect transformed model diagnostics.
-
-```{r}
-#| label: diagnostics-transformed-2
-
-# check final model diagnostics
-plot(mod_final_int, which = 1:2)
-
-```
-
-Maybe slightly better normality of the errors and minuscule increase in $R^2_{adj}$.
-
-```{r}
-#| label: summaries-2
-
-# compare model summaries
-map(list(mod_final_int, mod_final_int_prime), broom::glance)
-
-```
-
-### Test with backtransformed predictions
-
-With $Y' = \sqrt{Y}$ $\Longrightarrow$ $Y = f'(Y') = (\sqrt{Y})^2 = (Y')^2$. Now back transform predictions and test.
-
-```{r}
-#| label: testing-transformed-2
-
-# calculate predictions for test set
-preds_int_prime <- predict(mod_final_int_prime, newdata = ames_test)
-
-# back transform predictions and calculate rmse
-bind_cols(ames_test, preds = preds_int_prime^2) %>% yardstick::rmse(sale_price, preds)
-
-```
